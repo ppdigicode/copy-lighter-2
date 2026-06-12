@@ -135,7 +135,7 @@ class CopyTradingBot:
         # Each bot tags its orders with a unique client_order_index to identify ownership
         # Bot 1 (Lighter→Lighter):     BOT_TAG = 1_000_000
         # Bot 2 (Hyperliquid→Lighter): BOT_TAG = 2_000_000
-        self.BOT_TAG = 1_000_000  # This is the Lighter→Lighter bot
+        self.BOT_TAG = 2_000_000  # This is the Lighter→Lighter bot
         self.order_counter = 0
         self.order_counter_lock = threading.Lock()
         # Track which bot opened each position: {market_index: client_order_index}
@@ -577,7 +577,7 @@ class CopyTradingBot:
             
             # V1.9.4: Check if this position belongs to THIS bot
             tag = position_tags.get(market_index, 0)
-            if tag < self.BOT_TAG or tag >= self.BOT_TAG + 1_000_000:
+            if tag < self.BOT_TAG or tag >= self.BOT_TAG + 2_000_000:
                 # This position was NOT opened by this bot - skip it
                 # (could be from bot 2, or manual trade, or bot with different tag)
                 continue
@@ -1351,7 +1351,7 @@ class CopyTradingBot:
                 self.order_counter += 1
                 # BOT_TAG (1_000_000) + counter ensures uniqueness per bot
                 # Max counter = 999_999 before wrapping (plenty for typical usage)
-                tagged_client_order_index = self.BOT_TAG + (self.order_counter % 1_000_000)
+                tagged_client_order_index = self.BOT_TAG + (self.order_counter % 2_000_000)
             
             async def _create_order_with_lock():
                 # Acquire lock in a thread-safe way
