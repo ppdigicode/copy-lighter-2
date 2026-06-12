@@ -1,0 +1,11 @@
+# Lighter Copy Trading Bot - Requirements
+# Python 3.8+
+
+# Lighter SDK (correct package name is 'lighter', not 'lighter-python')
+lighter
+
+# WebSocket support
+websockets>=12.0
+
+# Environment variables
+python-dotenv>=1.0.0
