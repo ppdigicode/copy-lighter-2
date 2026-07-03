@@ -611,6 +611,13 @@ class CopyTradingBot:
             # V1.9.4/V1.9.7: Check if this position belongs to THIS bot.
             # Ownership = tag falls inside this bot's fixed-width band.
             tag = position_tags.get(market_index, 0)
+            
+            # Multi-bot: If tag is 0, this position came from sync without known origin
+            # (likely opened by another bot, or manual trade)
+            # Ignore it to avoid closing other bots' positions
+            if tag == 0:
+                continue
+            
             if tag < self.BOT_TAG or tag >= self.BOT_TAG + self.TAG_WIDTH:
                 # This position was NOT opened by this bot - skip it
                 # (could be from bot 2, or manual trade, or bot with different tag)
