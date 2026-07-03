@@ -52,7 +52,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Trading Bot v1.9.7")
+        print("\n🤖 Lighter Trading Bot v1.9.7-orphan fix")
 
         load_dotenv()
 
