@@ -64,7 +64,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Trading Bot v1.9.8")
+        print("\n🤖 Lighter Trading Bot v1.9.8-orphan fix")
 
         load_dotenv()
 
@@ -191,6 +191,11 @@ class CopyTradingBot:
         self.orphan_close_cooldown_sec = float(os.getenv("ORPHAN_CLOSE_COOLDOWN_SEC", "2.0"))  # Increased from 1.0
         self.target_positions_actual = {}   # {market_index: net size} from API
         self.last_orphan_close_ts = {}      # {market_index: last_attempt_time_sec}
+        # V1.9.8: count consecutive orphan-close attempts per market. If we keep trying
+        # to close the same market without the estimate ever clearing, the estimate is a
+        # ghost (real position already gone) — after a few tries we force-reconcile it.
+        self.orphan_close_attempts = {}     # {market_index: consecutive attempt count}
+        self.orphan_close_attempts_max = int(os.getenv("ORPHAN_CLOSE_ATTEMPTS_MAX", "3"))
         self.target_state_thread = None
 
         # === Async pipeline ===
@@ -687,6 +692,35 @@ class CopyTradingBot:
             
             with self.state_lock:
                 self.last_orphan_close_ts[market_index] = now
+                # V1.9.8: track consecutive attempts on this market
+                attempts = self.orphan_close_attempts.get(market_index, 0) + 1
+                self.orphan_close_attempts[market_index] = attempts
+
+            # V1.9.8: If we've tried repeatedly without the estimate clearing, the
+            # estimate is almost certainly a ghost (real position already gone). Force a
+            # fresh sync and reconcile our estimate to reality instead of looping.
+            if attempts > self.orphan_close_attempts_max:
+                try:
+                    if self.main_loop and self.main_loop.is_running():
+                        fut = asyncio.run_coroutine_threadsafe(
+                            self._sync_positions_from_exchange_async(verbose=False),
+                            self.main_loop
+                        )
+                        fut.result(timeout=2)
+                except Exception:
+                    pass
+                with self.state_lock:
+                    real_net = self.open_positions.get(market_index, 0.0)
+                    # Reconcile our estimate to the real account net (bounded to our side).
+                    if abs(real_net) < 1e-8:
+                        self.open_positions_est.pop(market_index, None)
+                        self.position_tags.pop(market_index, None)
+                    else:
+                        self.open_positions_est[market_index] = real_net
+                    self.orphan_close_attempts.pop(market_index, None)
+                print(f"   ♻️  {symbol}: {attempts-1} close attempts with no effect — "
+                      f"estimate reconciled to real net {real_net:.4f}, stopping loop")
+                continue
 
             # V1.9.7: Derive the close hint from THIS bot's estimated position when
             # available (it carries this bot's own sign/size), falling back to the
@@ -866,6 +900,26 @@ class CopyTradingBot:
         with self.state_lock:
             account_net = self.open_positions.get(market_index, 0.0)
             our_est = self.open_positions_est.get(market_index, account_net)
+
+        # V1.9.8: Ghost-estimate reconciliation.
+        # We just synced account_net from the exchange (above). In multi-bot mode we
+        # deliberately never overwrite open_positions_est from the API, so if our
+        # estimate drifted (missed fill, restart, prior close that fully filled), it can
+        # claim a position the account no longer holds. A reduce_only close would then
+        # fill nothing, no fill event would arrive, the estimate would never update, and
+        # the orphan check would loop forever. Detect that here: if the real account has
+        # no position on our side, our estimate is a ghost — clear it and stop.
+        est_sign = 0 if abs(our_est) < 1e-8 else math.copysign(1, our_est)
+        net_sign = 0 if abs(account_net) < 1e-8 else math.copysign(1, account_net)
+        if est_sign != 0 and net_sign != est_sign:
+            # Either the account is flat, or it only holds the OTHER sign (another bot).
+            # Our estimated position on this market cannot really exist. Reconcile.
+            with self.state_lock:
+                self.open_positions_est.pop(market_index, None)
+                self.position_tags.pop(market_index, None)
+            print(f"   ♻️  Estimate reconciled: no real {symbol} position on our side "
+                  f"(est was {our_est:.4f}, account net {account_net:.4f}) — cleared, skipping close")
+            return
 
         # Use our own estimated position as the source of truth for sign and size.
         current_pos = our_est if abs(our_est) > 1e-8 else 0.0
@@ -1781,12 +1835,16 @@ class CopyTradingBot:
                     self.open_positions.pop(market_index, None)
                 self.open_positions_est.pop(market_index, None)
                 self.position_tags.pop(market_index, None)  # V1.9.4: Clean up tag
+                self.orphan_close_attempts.pop(market_index, None)  # V1.9.8: reset loop guard
                 position_closed = True
             else:
                 # V1.9.8: In multi-bot mode, don't overwrite the shared account net.
                 if not self.multi_bot_mode:
                     self.open_positions[market_index] = new_pos
                 self.open_positions_est[market_index] = new_pos
+                # V1.9.8: a real fill moved our estimate — reset the loop guard so a
+                # legitimate future orphan gets full retries again.
+                self.orphan_close_attempts.pop(market_index, None)
             
             # Track last observed price for market orders
             self.last_observed_prices[market_index] = avg_price
