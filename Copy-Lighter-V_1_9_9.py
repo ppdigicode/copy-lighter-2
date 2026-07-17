@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lighter Copy Trading Bot V1.9.9 - Educational Example
+Lighter Copy Trading Bot V1.9.8 - Educational Example
 
 ⚠️  WARNING: This bot trades with REAL money on MAINNET
     - Always test in DRY_RUN mode first
@@ -64,7 +64,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Trading Bot v1.9.9")
+        print("\n🤖 Lighter Trading Bot v1.9.9-17/07/2026")
 
         load_dotenv()
 
@@ -122,7 +122,13 @@ class CopyTradingBot:
         # === State Tracking ===
         self.processed_fills = set()      # Avoid duplicate fills (TARGET only; includes aggregated ids)
         self.open_positions = {}          # {market_index: net size} - positive=long, negative=short (OUR ACCOUNT)
-        self.open_positions_est = {}      # {market_index: net size} optimistic/estimated
+        self.open_positions_est = {}      # {market_index: net size} optimistic/estimated (bumped at order placement)
+        # V1.9.8 fix: this bot's own CONFIRMED position, updated ONLY by confirmed fills
+        # (never by the optimistic bump at order placement). In multi-bot mode this is
+        # the correct "before" baseline for the fill flush — open_positions_est cannot be
+        # used for that because it was already bumped optimistically for the very order
+        # whose fill we're processing, which would double-count the same delta.
+        self.open_positions_confirmed = {}
         self.market_metadata = {}         # Cached metadata per market
         self.target_positions = {}        # {market_index: net size} - target trader reconstructed
 
@@ -146,10 +152,21 @@ class CopyTradingBot:
         self.trade_entry_costs = {}   # {market_index: total_cost}
         
         # ---- Target PnL tracking (for comparison) ----
+        # V1.9.8 REWRITE: target_entry_costs is now correctly REDUCED on each target
+        # close (mirroring self.trade_entry_costs), so it always reflects the cost
+        # basis of the target's CURRENTLY open portion, not a lifetime cumulative sum.
+        # target_exit_costs is gone: instead, each target close computes its own exact
+        # dollar PnL on the spot (per raw WS trade, no batching ambiguity) and that
+        # value is queued in pending_target_close_pnl for the matching copy-order fill
+        # to consume — a direct dollar comparison instead of a derived cost ratio.
         self.target_entry_prices = {}  # {market_index: weighted_avg_entry_price}
-        self.target_entry_costs = {}   # {market_index: total_cost}
+        self.target_entry_costs = {}   # {market_index: cost basis of currently-open portion}
         self.target_position_sizes = {}  # {market_index: total_size}
-        self.target_exit_costs = {}    # {market_index: total_exit_cost} - for PnL calculation
+        self.pending_target_close_pnl = {}  # {market_index: accumulated $ PnL target realized, awaiting our matching fill}
+        # V1.9.8: last time we processed a live WS trade for this market, used to gate
+        # the periodic API reconciliation so it never races an in-flight WS fill for the
+        # same trade (which would double-count the position — see _sync_target_actual_positions_async).
+        self.last_target_ws_update_ts = {}
         
         # ---- Order price tracking (for slippage calculation) ----
         self.order_intended_prices = {}  # {market_index: intended_price} - price we sent in order
@@ -571,10 +588,22 @@ class CopyTradingBot:
                 # be misread as a CLOSE (or vice-versa), so the bot fails to copy it.
                 # The API snapshot is ground truth, so we realign to it here.
                 #
-                # We only correct on a genuine mismatch (different sign, or a size gap
-                # beyond a small tolerance) to avoid clobbering a fresh WS fill that the
-                # API snapshot — taken a moment earlier — hasn't caught up to yet.
+                # RACE CONDITION GUARD: a REST snapshot can reflect a trade that already
+                # executed exchange-side moments before the corresponding WS event has
+                # been delivered to us. If we reconciled blindly, that trade would be
+                # double-counted: once by this reconciliation, once again when the
+                # (delayed) WS event lands and adds its own delta on top. To prevent
+                # this, we only reconcile a market if there has been NO WS-driven update
+                # for it in the last RECONCILE_QUIET_PERIOD_SEC — i.e. only during a
+                # genuine quiet period (disconnect, missed trade), never while the WS
+                # feed is actively delivering trades for that market.
+                RECONCILE_QUIET_PERIOD_SEC = 2.0
+                now_ts = time.time()
+
                 for market_index, real_net in new_target_positions.items():
+                    last_ws = self.last_target_ws_update_ts.get(market_index, 0.0)
+                    if (now_ts - last_ws) < RECONCILE_QUIET_PERIOD_SEC:
+                        continue  # WS is live for this market — don't race it
                     recon = self.target_positions.get(market_index, 0.0)
                     real_sign = 0 if abs(real_net) < 1e-8 else math.copysign(1, real_net)
                     recon_sign = 0 if abs(recon) < 1e-8 else math.copysign(1, recon)
@@ -589,14 +618,23 @@ class CopyTradingBot:
 
                 # Markets the target has fully exited (absent from the API snapshot)
                 # but still shown as open in our reconstruction: reset them to flat.
+                # Same quiet-period guard applies.
                 for market_index in list(self.target_positions.keys()):
-                    if market_index not in new_target_positions and abs(self.target_positions.get(market_index, 0.0)) > 1e-8:
-                        old = self.target_positions[market_index]
-                        self.target_positions[market_index] = 0.0
-                        self.target_position_sizes.pop(market_index, None)
-                        print(f"   🔄 Target flat per API: "
-                              f"{self._get_market_symbol(market_index)} "
-                              f"{old:.4f} → 0 (WS had missed the close)")
+                    if market_index in new_target_positions:
+                        continue
+                    if abs(self.target_positions.get(market_index, 0.0)) <= 1e-8:
+                        continue
+                    last_ws = self.last_target_ws_update_ts.get(market_index, 0.0)
+                    if (now_ts - last_ws) < RECONCILE_QUIET_PERIOD_SEC:
+                        continue
+                    old = self.target_positions[market_index]
+                    self.target_positions[market_index] = 0.0
+                    self.target_position_sizes.pop(market_index, None)
+                    self.target_entry_costs.pop(market_index, None)
+                    self.target_entry_prices.pop(market_index, None)
+                    print(f"   🔄 Target flat per API: "
+                          f"{self._get_market_symbol(market_index)} "
+                          f"{old:.4f} → 0 (WS had missed the close)")
 
         except Exception as e:
             if not self.stop_event.is_set():
@@ -1303,10 +1341,18 @@ class CopyTradingBot:
                 delta = size if is_buy else -size
                 new_target = current_target + delta
                 self.target_positions[market_index] = new_target
+                # V1.9.8: mark this market as "live" so the periodic API reconciliation
+                # won't race this same trade (see _sync_target_actual_positions_async).
+                self.last_target_ws_update_ts[market_index] = time.time()
                 
                 # Track target's PnL for comparison
                 is_target_opening = (current_target == 0) or (current_target > 0 and delta > 0) or (current_target < 0 and delta < 0)
                 is_target_closing = (current_target > 0 and delta < 0) or (current_target < 0 and delta > 0)
+                
+                # V1.9.8: dollar PnL the TARGET realized on this specific trade (close
+                # only). Computed here, per raw WS trade — no coalescing/batching
+                # ambiguity on this side, so this is always exact.
+                target_trade_pnl = None
                 
                 if is_target_opening:
                     # Opening or adding - update entry price
@@ -1319,12 +1365,29 @@ class CopyTradingBot:
                         self.target_entry_prices[market_index] = new_cost / abs(new_target)
                 
                 elif is_target_closing:
-                    # Closing - track exit cost for PnL calculation
-                    if not hasattr(self, 'target_exit_costs'):
-                        self.target_exit_costs = {}
+                    # V1.9.8 FIX: previously this only accumulated an ever-growing
+                    # "target_exit_costs" total without ever reducing target_entry_costs,
+                    # so any market opened/closed more than once in a session ended up
+                    # with a meaningless, unbounded cost basis. Now: reduce entry cost
+                    # proportionally (like our own side already does) and compute this
+                    # trade's exact $ PnL directly from target's own entry/exit prices.
+                    entry_cost = self.target_entry_costs.get(market_index, 0)
+                    close_ratio = min(size / abs(current_target), 1.0) if abs(current_target) > 1e-8 else 0.0
+                    closed_entry_cost = entry_cost * close_ratio
+                    exit_value = size * price
+                    if current_target > 0:  # target was LONG, this SELL closes it
+                        target_trade_pnl = exit_value - closed_entry_cost
+                    else:  # target was SHORT, this BUY closes it
+                        target_trade_pnl = closed_entry_cost - exit_value
+                    self.target_entry_costs[market_index] = entry_cost - closed_entry_cost
+                    self.target_position_sizes[market_index] = abs(new_target)
                     
-                    old_exit_cost = self.target_exit_costs.get(market_index, 0)
-                    self.target_exit_costs[market_index] = old_exit_cost + (size * price)
+                    if abs(new_target) < 1e-8:
+                        # Target is fully flat on this market: reset its cost tracking
+                        # so a future re-open starts from a clean basis.
+                        self.target_entry_costs.pop(market_index, None)
+                        self.target_entry_prices.pop(market_index, None)
+                        self.target_position_sizes.pop(market_index, None)
             
             # Now current_target has the OLD position (before this fill)
             # new_target has the NEW position (after this fill)
@@ -1454,6 +1517,18 @@ class CopyTradingBot:
                 frac_pct = frac * 100
                 print(f"   📉 Target close: {frac_pct:.1f}% of their position")
                 print(f"   📉 Our close: {our_close_sz:.4f} (from our est pos {abs(our_pos_est):.4f})")
+                
+                # V1.9.8: queue the target's exact $ PnL for this close so our matching
+                # fill (processed later, async, in _flush_pending_fills) can show a
+                # dollar-accurate comparison instead of a derived ratio. Only queued once
+                # we've committed to actually placing a corresponding order — if we skip
+                # copying this event (filtered, zero-size, etc.) we simply don't queue it,
+                # since there will be no fill to consume it anyway.
+                if target_trade_pnl is not None:
+                    with self.state_lock:
+                        self.pending_target_close_pnl[market_index] = (
+                            self.pending_target_close_pnl.get(market_index, 0.0) + target_trade_pnl
+                        )
                 
                 # Place close order
                 self._place_order_internal(market_index, is_buy, our_close_sz, price, is_closing=True, target_fill_time_ms=event_ms)
@@ -1800,10 +1875,15 @@ class CopyTradingBot:
             if market_index not in self.pending_fills:
                 # Snapshot the CURRENT position before any fill is applied.
                 # This is the only correct baseline for close_ratio in PnL calculations.
-                # V1.9.8: In multi-bot mode, snapshot THIS bot's own estimated position,
-                # not the shared account net (which blends all bots on the account).
+                # V1.9.8 FIX: In multi-bot mode we must snapshot THIS bot's own CONFIRMED
+                # position (open_positions_confirmed), NOT open_positions_est. The estimate
+                # is bumped optimistically at order placement time (_place_order_internal),
+                # BEFORE this fill arrives — so by the time we get here, open_positions_est
+                # already includes this very fill's delta. Using it as "before" would double
+                # -count the delta (once at placement, once here), inflating the confirmed
+                # position to roughly 2x its real size.
                 if self.multi_bot_mode:
-                    position_before = self.open_positions_est.get(market_index, 0.0)
+                    position_before = self.open_positions_confirmed.get(market_index, 0.0)
                 else:
                     position_before = self.open_positions.get(market_index, 0.0)
                 self.pending_fills[market_index] = {
@@ -1863,11 +1943,13 @@ class CopyTradingBot:
             client_order_index = buffer.get('client_order_index', 0)  # V1.9.4: Extract tag
             # Use the position snapshot taken at first-fill time, not the current
             # open_positions value which may have been updated by subsequent flushes.
-            # V1.9.8: In multi-bot mode, track against THIS bot's own estimated position,
-            # not the shared account net (which blends all bots on the account).
+            # V1.9.8 FIX: track against THIS bot's own CONFIRMED position
+            # (open_positions_confirmed), never open_positions_est. The estimate is
+            # bumped optimistically at order placement, so using it here would apply
+            # this fill's delta a second time on top of the placement-time bump.
             if self.multi_bot_mode:
                 current = buffer.get('position_before',
-                                     self.open_positions_est.get(market_index, 0.0))
+                                     self.open_positions_confirmed.get(market_index, 0.0))
             else:
                 current = buffer.get('position_before',
                                      self.open_positions.get(market_index, 0.0))
@@ -1881,36 +1963,60 @@ class CopyTradingBot:
             # current = position BEFORE this batch of fills (captured at first fill time)
             # new_pos = what the real position will be after this batch
             delta = total_size if side == 'BUY' else -total_size
-            # V1.9.8: base new_pos on the same reference we track ownership against
+            # V1.9.8 FIX: base new_pos on the CONFIRMED position, not the optimistic
+            # estimate, for the same double-counting reason as above.
             if self.multi_bot_mode:
-                actual_current = self.open_positions_est.get(market_index, 0.0)
+                actual_current = self.open_positions_confirmed.get(market_index, 0.0)
             else:
                 actual_current = self.open_positions.get(market_index, 0.0)
             new_pos = actual_current + delta
             
-            # Track entry price for PnL calculation
-            is_opening = (current == 0) or (current > 0 and delta > 0) or (current < 0 and delta < 0)
-            is_closing = (current > 0 and delta < 0) or (current < 0 and delta > 0)
+            # V1.9.8 FIX: split this batch into a CLOSING portion (bounded by the
+            # position that existed before it) and an OPENING portion (any remainder).
+            # A remainder occurs on a "flip": two of our own orders (e.g. one closing
+            # a LONG, one opening a SHORT immediately after) can coalesce into the SAME
+            # buffer if their fills land within the coalescing window. Previously,
+            # close_ratio = total_size / abs(current) could then exceed 1.0, consuming
+            # MORE than the actual entry cost and driving trade_entry_costs negative —
+            # silently corrupting every PnL calculation on that market from then on.
+            # Splitting bounds close_ratio at exactly 1.0 and correctly opens a fresh
+            # cost basis for the flip remainder.
+            if current == 0:
+                closing_size, opening_size = 0.0, abs(delta)
+            elif (current > 0 and delta < 0) or (current < 0 and delta > 0):
+                reducing = min(abs(delta), abs(current))
+                closing_size = reducing
+                opening_size = abs(delta) - reducing  # > 0 only on a flip
+            else:
+                closing_size, opening_size = 0.0, abs(delta)
             
-            if is_opening:
-                # Opening or adding to position - update entry cost
-                old_cost = self.trade_entry_costs.get(market_index, 0)
-                new_cost = old_cost + total_cost
-                self.trade_entry_costs[market_index] = new_cost
-                self.trade_entry_prices[market_index] = new_cost / abs(new_pos) if new_pos != 0 else avg_price
-                
-                # V1.9.4: Store the tag for this position (for orphan detection)
-                if client_order_index > 0:
-                    self.position_tags[market_index] = client_order_index
+            is_opening = opening_size > 1e-12
+            is_closing = closing_size > 1e-12
+            is_flip = is_opening and is_closing
             
             # Sur chaque close : calculer closed_entry_cost et réduire entry_cost
+            # (must run BEFORE the opening block so a flip's remainder starts from the
+            # correctly-zeroed cost basis left behind by fully closing the prior side)
             closed_entry_cost = 0.0
             if is_closing:
                 entry_cost = self.trade_entry_costs.get(market_index, 0)
                 if entry_cost > 0 and abs(current) > 1e-8:
-                    close_ratio = total_size / abs(current)
+                    close_ratio = closing_size / abs(current)  # now guaranteed <= 1.0
                     closed_entry_cost = entry_cost * close_ratio
                     self.trade_entry_costs[market_index] = entry_cost - closed_entry_cost
+            
+            if is_opening:
+                # Opening or adding to position - update entry cost
+                opening_cost = opening_size * avg_price
+                old_cost = self.trade_entry_costs.get(market_index, 0)
+                new_cost = old_cost + opening_cost
+                self.trade_entry_costs[market_index] = new_cost
+                denom = abs(new_pos) if abs(new_pos) > 1e-12 else opening_size
+                self.trade_entry_prices[market_index] = new_cost / denom if denom > 0 else avg_price
+                
+                # V1.9.4: Store the tag for this position (for orphan detection)
+                if client_order_index > 0:
+                    self.position_tags[market_index] = client_order_index
 
             # Clean up positions very close to zero
             position_closed = False
@@ -1919,6 +2025,11 @@ class CopyTradingBot:
                 # owned by the API sync — don't pop it here, only clear our own tracking.
                 if not self.multi_bot_mode:
                     self.open_positions.pop(market_index, None)
+                # V1.9.8 FIX: new_pos is the CONFIRMED truth (derived from
+                # open_positions_confirmed + this fill's delta) — reset the estimate to
+                # match it, correcting any optimistic drift, exactly like single-bot mode
+                # already does relative to open_positions.
+                self.open_positions_confirmed.pop(market_index, None)
                 self.open_positions_est.pop(market_index, None)
                 self.position_tags.pop(market_index, None)  # V1.9.4: Clean up tag
                 self.orphan_close_attempts.pop(market_index, None)  # V1.9.8: reset loop guard
@@ -1927,6 +2038,9 @@ class CopyTradingBot:
                 # V1.9.8: In multi-bot mode, don't overwrite the shared account net.
                 if not self.multi_bot_mode:
                     self.open_positions[market_index] = new_pos
+                # V1.9.8 FIX: new_pos is confirmed truth; store it as such, then reset
+                # the optimistic estimate to match it (clears any placement-time drift).
+                self.open_positions_confirmed[market_index] = new_pos
                 self.open_positions_est[market_index] = new_pos
                 # V1.9.8: a real fill moved our estimate — reset the loop guard so a
                 # legitimate future orphan gets full retries again.
@@ -1974,10 +2088,20 @@ class CopyTradingBot:
         else:
             print(f"✅ Our fill: {side} {total_size:.4f} {symbol} @ ${avg_price:.{price_decimals}f}{slippage_str}{latency_str}")
         
+        # V1.9.8: note when this batch was a flip (closed one side, opened the other)
+        if is_flip:
+            new_side = 'LONG' if new_pos > 0 else 'SHORT'
+            print(f"   🔀 Flip detected: closed prior position, opened new {new_side} "
+                  f"{abs(new_pos):.4f} {symbol}")
+
         # Log PnL sur chaque close (partiel ou total)
         # closed_entry_cost a été calculé dans le bloc is_closing (dans la lock)
         if is_closing and closed_entry_cost > 0:
-            exit_value = total_cost
+            # V1.9.8 FIX: exit_value must reflect ONLY the closing portion of this
+            # batch, at this batch's weighted avg price. Using total_cost here (the
+            # old behavior) was wrong whenever the batch also contained an opening
+            # portion (a flip), since total_cost covers the full batch size.
+            exit_value = closing_size * avg_price
 
             if current > 0:  # Was LONG: PnL = exit - entry
                 our_pnl = exit_value - closed_entry_cost
@@ -1986,32 +2110,30 @@ class CopyTradingBot:
 
             pnl_sign = "+" if our_pnl >= 0 else ""
 
-            # Compute target PnL for comparison (based on the same close fraction)
+            # V1.9.8 REWRITE: target PnL is no longer derived from a cost ratio
+            # (which mixed our own dollar scale with the target's and was never
+            # dimensionally meaningful). Instead we consume the exact dollar PnL
+            # the target realized on the closes that triggered our copy order(s)
+            # in this batch, queued in pending_target_close_pnl by _process_target_fill.
             target_pnl_str = ""
             with self.state_lock:
-                t_entry = self.target_entry_costs.get(market_index, 0)
-                t_exit  = self.target_exit_costs.get(market_index, 0)
-            if t_entry > 0 and t_exit > 0:
-                frac = abs(closed_entry_cost / t_entry) if t_entry > 0 else 0
-                t_closed_entry = t_entry * frac
-                t_exit_frac    = t_exit * frac
-                if current > 0:
-                    target_pnl = t_exit_frac - t_closed_entry
-                else:
-                    target_pnl = t_closed_entry - t_exit_frac
+                target_pnl = self.pending_target_close_pnl.pop(market_index, None)
+            if target_pnl is not None:
                 t_sign = "+" if target_pnl >= 0 else ""
                 pct_vs_target = (our_pnl / target_pnl * 100) if abs(target_pnl) > 1e-6 else 0
                 target_pnl_str = f" | target: {t_sign}${target_pnl:.2f} ({pct_vs_target:.0f}%)"
 
             if position_closed:
                 print(f"   💰 Position CLOSED: PnL {pnl_sign}${our_pnl:.2f}{target_pnl_str}")
-                # Clean up tous les trackers
+                # Clean up OUR OWN trackers only. Target-side trackers follow the
+                # TARGET's own position lifecycle (handled independently in
+                # _process_target_fill when the target itself goes flat) — they must
+                # NOT be wiped here, since the target can still hold an open remainder
+                # even after OUR position is fully closed (rounding, coin filters,
+                # missed fills, etc.). Wiping them here would corrupt the target's own
+                # still-open cost basis.
                 self.trade_entry_prices.pop(market_index, None)
                 self.trade_entry_costs.pop(market_index, None)
-                self.target_entry_prices.pop(market_index, None)
-                self.target_entry_costs.pop(market_index, None)
-                self.target_position_sizes.pop(market_index, None)
-                self.target_exit_costs.pop(market_index, None)
             else:
                 print(f"   💰 Partial close PnL: {pnl_sign}${our_pnl:.2f}{target_pnl_str} (pos restante: {abs(new_pos):.4f})") 
 
